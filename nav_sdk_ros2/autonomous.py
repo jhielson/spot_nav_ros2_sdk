@@ -53,6 +53,8 @@ class GraphNavInterface(object):
         self._robot_state_y = 0
         self._robot_state_yaw = 0
 
+        self._flag_nav = False
+
         # Force trigger timesync.
         self._robot.time_sync.wait_for_sync()
 
@@ -97,7 +99,8 @@ class GraphNavInterface(object):
             '6': self._navigate_to,
             '7': self._navigate_route,
             '8': self._navigate_to_anchor,
-            '9': self._clear_graph
+            '9': self._clear_graph,
+            '10': self._navigate_to_anchor_once
         }
 
     def _get_localization_state(self, *args):
@@ -216,6 +219,74 @@ class GraphNavInterface(object):
                 'Upload complete! The robot is currently not localized to the map; please localize'
                 ' the robot using commands (2) or (3) before attempting a navigation command.')
 
+    def _navigate_to_anchor_once(self, *args):
+        """Navigate to a pose in seed frame, using anchors."""
+        # The following options are accepted for arguments: [x, y], [x, y, yaw], [x, y, z, yaw],
+        # [x, y, z, qw, qx, qy, qz].
+        # When a value for z is not specified, we use the current z height.
+        # When only yaw is specified, the quaternion is constructed from the yaw.
+        # When yaw is not specified, an identity quaternion is used.
+
+        if self._flag_nav == False:
+            if len(args) < 1 or len(args[0]) not in [2, 3, 4, 7]:
+                print('Invalid arguments supplied.')
+                return
+
+            self._seed_T_goal = SE3Pose(float(args[0][0]), float(args[0][1]), 0.0, Quat())
+
+            if len(args[0]) in [4, 7]:
+                self._seed_T_goal.z = float(args[0][2])
+            else:
+                localization_state = self._graph_nav_client.get_localization_state()
+                if not localization_state.localization.waypoint_id:
+                    print('Robot not localized')
+                    return
+                self._seed_T_goal.z = localization_state.localization.seed_tform_body.position.z
+
+            if len(args[0]) == 3:
+                self._seed_T_goal.rot = Quat.from_yaw(float(args[0][2]))
+            elif len(args[0]) == 4:
+                self._seed_T_goal.rot = Quat.from_yaw(float(args[0][3]))
+            elif len(args[0]) == 7:
+                self._seed_T_goal.rot = Quat(w=float(args[0][3]), x=float(args[0][4]), y=float(args[0][5]),
+                                       z=float(args[0][6]))
+
+            if not self.toggle_power(should_power_on=True):
+                print('Failed to power on the robot, and cannot complete navigate to request.')
+                return
+
+        nav_to_cmd_id = None
+        # Navigate to the destination.
+        is_finished = False
+        
+        self._flag_nav = True
+
+        # Issue the navigation command about twice a second such that it is easy to terminate the
+        # navigation command (with estop or killing the program).
+        state = self._graph_nav_client.get_localization_state() 
+        self._robot_state_x = state.localization.seed_tform_body.position.x
+        self._robot_state_y = state.localization.seed_tform_body.position.y
+        rot = state.localization.seed_tform_body.rotation
+        orientation = [rot.x, rot.y, rot.z, rot.w]
+        (roll, pitch, yaw) = euler_from_quaternion(orientation)
+        self._robot_state_yaw = yaw
+  
+        nav_to_cmd_id = self._graph_nav_client.navigate_to_anchor(
+            self._seed_T_goal.to_proto(), 1.0, command_id=nav_to_cmd_id)
+        
+        time.sleep(.5)  # Sleep for half a second to allow for command execution.
+        # Poll the robot for feedback to determine if the navigation command is complete. Then sit
+        # the robot down once it is finished.
+        is_finished = self._check_success(nav_to_cmd_id)
+ 
+        print(is_finished)
+
+        if is_finished == True:
+            self._flag_nav = False
+
+        return is_finished
+
+
     def _navigate_to_anchor(self, *args):
         """Navigate to a pose in seed frame, using anchors."""
         # The following options are accepted for arguments: [x, y], [x, y, yaw], [x, y, z, yaw],
@@ -258,7 +329,7 @@ class GraphNavInterface(object):
             # Issue the navigation command about twice a second such that it is easy to terminate the
             # navigation command (with estop or killing the program).
             try:
-                state = self._graph_nav_client.get_localization_state() ################################
+                state = self._graph_nav_client.get_localization_state() 
                 self._robot_state_x = state.localization.seed_tform_body.position.x
                 self._robot_state_y = state.localization.seed_tform_body.position.y
                 rot = state.localization.seed_tform_body.rotation
@@ -517,6 +588,12 @@ class GraphNavInterface(object):
         cmd_func = self._command_dictionary['8']
         cmd_func([x,y,yaw])       
   
+    def run_next_position_once(self, x, y, yaw):
+       # Move to its initial position
+       cmd_func = self._command_dictionary['10']
+       result = cmd_func([x,y,yaw])
+       return result
+     
 
 class NavROS2SDK(Node):
     def __init__(self):
@@ -526,15 +603,76 @@ class NavROS2SDK(Node):
     def run(self, graph_nav_command_line, lease_client):
         try:
             with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
+                # Upload Graph
+                try:
+                    cmd_func = graph_nav_command_line._command_dictionary['5']
+                    cmd_func()
+                except Exception as e:
+                    print(e)
+                    return False
+
+                # List waypoints
+                try:
+                    cmd_func = graph_nav_command_line._command_dictionary['4']
+                    cmd_func()
+                except Exception as e:
+                    print(e)
+                    return False
+
+                # Initialize localization to the nearest fiducial (must be in sight of a fiducial).
+                #try:
+                #    cmd_func = graph_nav_command_line._command_dictionary['2']
+                #    cmd_func()
+                #except Exception as e:
+                #    print(e)
+                #    return False
+
+                # Initialize localization to a specific waypoint (must be exactly at the waypoint).
+                try:
+                    cmd_func = graph_nav_command_line._command_dictionary['3']
+                    cmd_func(['rp'])
+                except Exception as e:
+                    print(e)
+                    return False
+
+                destinations = [(2.5,-1.0,1.7),(2.0,-1.5,0),(1.67,0,3.1)]
+                i = 0
+                while rclpy.ok():
+                    #print(":: Initiate Loop")
+                    #rclpy.spin_once(self)
+                    try:    
+                        # Send command
+                        #print(f"Send command: i: {i}")
+                        result = graph_nav_command_line.run_next_position_once(destinations[i][0],destinations[i][1],destinations[i][2])
+                        print(f'Is it Completed: {result}')
+
+                        # Get Robot position
+                        print(f'X: {graph_nav_command_line._robot_state_x}  Y: {graph_nav_command_line._robot_state_y}  YAW: {graph_nav_command_line._robot_state_yaw}')
+
+                        if result:       
+                            i = i + 1
+                            if i == len(destinations):
+                                return True
+
+                    except Exception as exc:  # pylint: disable=broad-except
+                        print(exc)
+                        print('Graph nav command line client threw an error.')
+                        return False
+        except ResourceAlreadyClaimedError:
+            print('The robot\'s lease is currently in use. Check for a tablet connection or try again in a few seconds.')
+            return False
+
+
+    def run_path(self, graph_nav_command_line, lease_client):
+        try:
+            with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
                 try:
                     # Send number of random waypoints
                     #graph_nav_command_line.run(3)
                    
                     # Send a sequence of positions
                     graph_nav_command_line.run_next_position(1.67,0,3.1)
-
                     graph_nav_command_line.run_next_position(2.0,-2.0,0)
-                    
                     graph_nav_command_line.run_next_position(1.67,0,3.1)
 
                     return True
@@ -548,9 +686,6 @@ class NavROS2SDK(Node):
             )
             return False
 
-        while rclpy.ok():
-            print("::")
-            rclpy.spin_once(self)
 
 
 def main(argv=None):
