@@ -13,6 +13,12 @@ import os
 import sys
 import time
 
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from tf_transformations import euler_from_quaternion
+
 import random
 from bosdyn.client import spot_cam
 
@@ -41,6 +47,11 @@ class GraphNavInterface(object):
 
     def __init__(self, robot, upload_path):
         self._robot = robot
+
+        # Robot state
+        self._robot_state_x = 0
+        self._robot_state_y = 0
+        self._robot_state_yaw = 0
 
         # Force trigger timesync.
         self._robot.time_sync.wait_for_sync()
@@ -115,7 +126,7 @@ class GraphNavInterface(object):
             # If no waypoint id is given as input, then return without initializing.
             print('No waypoint specified to initialize to.')
             return
-        destination_waypoint = graph_nav_util.find_unique_waypoint_id(
+        destination_waypoint = find_unique_waypoint_id(
             args[0][0], self._current_graph, self._current_annotation_name_to_wp_id)
         if not destination_waypoint:
             # Failed to find the unique waypoint id.
@@ -149,7 +160,7 @@ class GraphNavInterface(object):
         localization_id = self._graph_nav_client.get_localization_state().localization.waypoint_id
 
         # Update and print waypoints and edges
-        self._current_annotation_name_to_wp_id, self._current_edges = graph_nav_util.update_waypoints_and_edges(
+        self._current_annotation_name_to_wp_id, self._current_edges = update_waypoints_and_edges(
             graph, localization_id)
 
     def _upload_graph_and_snapshots(self, *args):
@@ -247,6 +258,15 @@ class GraphNavInterface(object):
             # Issue the navigation command about twice a second such that it is easy to terminate the
             # navigation command (with estop or killing the program).
             try:
+                state = self._graph_nav_client.get_localization_state() ################################
+                self._robot_state_x = state.localization.seed_tform_body.position.x
+                self._robot_state_y = state.localization.seed_tform_body.position.y
+                rot = state.localization.seed_tform_body.rotation
+                orientation = [rot.x, rot.y, rot.z, rot.w]
+                (roll, pitch, yaw) = euler_from_quaternion(orientation)
+                self._robot_state_yaw = yaw 
+                print(f'X: {self._robot_state_x}  Y: {self._robot_state_y}  YAW: {self._robot_state_yaw}')
+
                 nav_to_cmd_id = self._graph_nav_client.navigate_to_anchor(
                     seed_T_goal.to_proto(), 1.0, command_id=nav_to_cmd_id)
             except ResponseError as e:
@@ -258,9 +278,9 @@ class GraphNavInterface(object):
             is_finished = self._check_success(nav_to_cmd_id)
 
         # Power off the robot if appropriate.
-        if self._powered_on and not self._started_powered_on:
-            # Sit the robot down + power off after the navigation command is complete.
-            self.toggle_power(should_power_on=False)
+        #if self._powered_on and not self._started_powered_on:
+        #    # Sit the robot down + power off after the navigation command is complete.
+        #    self.toggle_power(should_power_on=False)
 
     def _navigate_to(self, *args):
         """Navigate to a specific waypoint."""
@@ -270,7 +290,7 @@ class GraphNavInterface(object):
             print('No waypoint provided as a destination for navigate to.')
             return
 
-        destination_waypoint = graph_nav_util.find_unique_waypoint_id(
+        destination_waypoint = find_unique_waypoint_id(
             args[0][0], self._current_graph, self._current_annotation_name_to_wp_id)
         if not destination_waypoint:
             # Failed to find the appropriate unique waypoint id for the navigation command.
@@ -286,6 +306,9 @@ class GraphNavInterface(object):
             # Issue the navigation command about twice a second such that it is easy to terminate the
             # navigation command (with estop or killing the program).
             try:
+                state = self._graph_nav_client.get_localization_state() ################################
+                print(f'Got localization: \n{state.localization}')      ################################
+
                 nav_to_cmd_id = self._graph_nav_client.navigate_to(destination_waypoint, 1.0,
                                                                    command_id=nav_to_cmd_id)
             except ResponseError as e:
@@ -309,7 +332,7 @@ class GraphNavInterface(object):
             return
         waypoint_ids = args[0]
         for i in range(len(waypoint_ids)):
-            waypoint_ids[i] = graph_nav_util.find_unique_waypoint_id(
+            waypoint_ids[i] = find_unique_waypoint_id(
                 waypoint_ids[i], self._current_graph, self._current_annotation_name_to_wp_id)
             if not waypoint_ids[i]:
                 # Failed to find the unique waypoint id.
@@ -435,49 +458,7 @@ class GraphNavInterface(object):
             self._robot_command_client.robot_command(RobotCommandBuilder.safe_power_off_command(),
                                                      end_time_secs=time.time())
 
-    def run(self):
-        '''
-        """Main loop for the command line interface."""
-        while True:
-            print("""
-            Options:
-            (1) Get localization state.
-            (2) Initialize localization to the nearest fiducial (must be in sight of a fiducial).
-            (3) Initialize localization to a specific waypoint (must be exactly at the waypoint)."""
-
-                  """
-            (4) List the waypoint ids and edge ids of the map on the robot.
-            (5) Upload the graph and its snapshots.
-            (6) Navigate to. The destination waypoint id is the second argument.
-            (7) Navigate route. The (in-order) waypoint ids of the route are the arguments.
-            (8) Navigate to in seed frame. The following options are accepted for arguments: [x, y],
-                [x, y, yaw], [x, y, z, yaw], [x, y, z, qw, qx, qy, qz]. (Don't type the braces).
-                When a value for z is not specified, we use the current z height.
-                When only yaw is specified, the quaternion is constructed from the yaw.
-                When yaw is not specified, an identity quaternion is used.
-            (9) Clear the current graph.
-            (q) Exit.
-            """)
-            try:
-                inputs = input('>')
-            except NameError:
-                pass
-            req_type = str.split(inputs)[0]
-
-            if req_type == 'q':
-                self._on_quit()
-                break
-
-            if req_type not in self._command_dictionary:
-                print('Request not in the known command dictionary.')
-                continue
-            try:
-                cmd_func = self._command_dictionary[req_type]
-                cmd_func(str.split(inputs)[1:])
-            except Exception as e:
-                print(e)
-        '''
-
+    def run(self,total_number_waypoints):
         # Upload Graph
         try:
             cmd_func = self._command_dictionary['5']
@@ -495,7 +476,7 @@ class GraphNavInterface(object):
         print(self._current_annotation_name_to_wp_id)
 
         number_waypoints = 0
-        while number_waypoints < 10:
+        while number_waypoints < total_number_waypoints:
             # Select a random waypoint
             res = key, val = random.choice(list(self._current_annotation_name_to_wp_id.items()))
             cmd_func = self._command_dictionary['6']
@@ -515,11 +496,62 @@ class GraphNavInterface(object):
             # Next waypoint
             number_waypoints+=1
 
+        # Move to its initial position
+        cmd_func = self._command_dictionary['8']
+        cmd_func([1.67,0,3.1])       
 
         # Power off the robot if appropriate.
         if self._powered_on and not self._started_powered_on:
             # Sit the robot down + power off after the navigation command is complete.
             self.toggle_power(should_power_on=False)
+  
+    def run_next_position(self, x, y, yaw):
+        # Upload Graph
+        try:
+            cmd_func = self._command_dictionary['5']
+            cmd_func()
+        except Exception as e:
+            print(e)
+        
+        # Move to its initial position
+        cmd_func = self._command_dictionary['8']
+        cmd_func([x,y,yaw])       
+  
+
+class NavROS2SDK(Node):
+    def __init__(self):
+        super().__init__("Nav_wrapper")
+        self.get_logger().info("This nav node works between ros2 and the spot sdk.")
+
+    def run(self, graph_nav_command_line, lease_client):
+        try:
+            with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
+                try:
+                    # Send number of random waypoints
+                    #graph_nav_command_line.run(3)
+                   
+                    # Send a sequence of positions
+                    graph_nav_command_line.run_next_position(1.67,0,3.1)
+
+                    graph_nav_command_line.run_next_position(2.0,-2.0,0)
+                    
+                    graph_nav_command_line.run_next_position(1.67,0,3.1)
+
+                    return True
+                except Exception as exc:  # pylint: disable=broad-except
+                    print(exc)
+                    print('Graph nav command line client threw an error.')
+                    return False
+        except ResourceAlreadyClaimedError:
+            print(
+                'The robot\'s lease is currently in use. Check for a tablet connection or try again in a few seconds.'
+            )
+            return False
+
+        while rclpy.ok():
+            print("::")
+            rclpy.spin_once(self)
+
 
 def main(argv=None):
     """Run the command-line interface."""
@@ -527,11 +559,34 @@ def main(argv=None):
     bosdyn.client.util.add_base_arguments(parser)
 
     # Setup and authenticate the robot.
-    sdk = bosdyn.client.create_standard_sdk('GraphNavClient')
+    sdk = bosdyn.client.create_standard_sdk('GraphNavSDKROS2')
     spot_cam.register_all_service_clients(sdk)
-
     hostname = "192.168.80.3"
-    upload_filepath = "."
+    upload_filepath = "/root/ros2_ws/src/nav_sdk_ros2/nav_sdk_ros2/downloaded_graph"
+    robot = sdk.create_robot(hostname)
+    bosdyn.client.util.authenticate(robot)
+
+    graph_nav_command_line = GraphNavInterface(robot, upload_filepath)
+    lease_client = robot.ensure_client(LeaseClient.default_service_name)
+
+    # ROS2
+    rclpy.init()
+    node = NavROS2SDK()
+    
+    # ROS2 - Multithread
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    
+    # Loop
+    node.run(graph_nav_command_line, lease_client)
+    
+    # Kill and shutdown
+    node.destroy_node()
+    rclpy.shutdown()
+
+    '''
+    hostname = "192.168.80.3"
+    upload_filepath = "/root/ros2_ws/src/nav_sdk_ros2/nav_sdk_ros2/downloaded_graph"
     robot = sdk.create_robot(hostname)
     bosdyn.client.util.authenticate(robot)
 
@@ -551,7 +606,7 @@ def main(argv=None):
             'The robot\'s lease is currently in use. Check for a tablet connection or try again in a few seconds.'
         )
         return False
-
+    '''
 
 if __name__ == '__main__':
     main()
