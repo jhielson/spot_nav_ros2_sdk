@@ -19,6 +19,14 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from tf_transformations import euler_from_quaternion
 
+from rclpy.action import ActionServer
+from rclpy.action import CancelResponse
+from rclpy.action import GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
+from rclpy.qos import QoSProfile
+from create_message_types.action import Navigation
+
 import random
 from bosdyn.client import spot_cam
 
@@ -596,16 +604,94 @@ class GraphNavInterface(object):
      
 
 class NavROS2SDK(Node):
-    def __init__(self):
+    def __init__(self, graph_nav_command_line, lease_client):
         super().__init__("Nav_wrapper")
         self.get_logger().info("This nav node works between ros2 and the spot sdk.")
+        
+        # SDK
+        self.graph_nav_command_line = graph_nav_command_line
+        self.lease_client = lease_client
 
-    def run(self, graph_nav_command_line, lease_client):
+        # Action message
+        self.nav = Navigation.Goal()
+ 
+        # Goal
+        self.goal_x = 0
+        self.goal_y = 0
+        self.goal_yaw = 0
+
+        # Initialise servers
+        self.action_server = ActionServer(
+            self,
+            Navigation,
+            'navigation',
+            execute_callback=self.execute_callback,
+            callback_group=ReentrantCallbackGroup(),
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback)
+
+    def goal_callback(self, goal_request):
+        # Accepts or rejects a client request to begin an action
+        self.get_logger().info('Received goal request :)')
+        self.goal_x = goal_request.x
+        self.goal_y = goal_request.y
+        self.goal_yaw = goal_request.yaw
+        return GoalResponse.ACCEPT
+
+    def cancel_callback(self, goal_handle):
+        # Accepts or rejects a client request to cancel an action
+        self.get_logger().info('Received cancel request :(')
+        return CancelResponse.ACCEPT
+
+    async def execute_callback(self, goal_handle):
+        self.get_logger().info('Executing goal...')
+        
         try:
-            with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
+            with LeaseKeepAlive(self.lease_client, must_acquire=True, return_at_exit=True):
+                while rclpy.ok():
+                    if goal_handle.is_cancel_requested:
+                        goal_handle.canceled()
+                        self.get_logger().info('Goal canceled')
+                        return Navigation.Result()
+                    try:
+                        # Send command
+                        #print(f"Send command: i: {i}")
+                        result = self.graph_nav_command_line.run_next_position_once(self.goal_x, self.goal_y, self.goal_yaw)
+                        print(f'Is it Completed: {result}')
+
+                        # Get Robot position
+                        print(f'X: {self.graph_nav_command_line._robot_state_x}  Y: {self.graph_nav_command_line._robot_state_y}  YAW: {self.graph_nav_command_line._robot_state_yaw}')
+                        feedback_msg = Navigation.Feedback()
+                        feedback_msg.x = self.graph_nav_command_line._robot_state_x
+                        feedback_msg.y = self.graph_nav_command_line._robot_state_y
+                        feedback_msg.yaw = self.graph_nav_command_line._robot_state_yaw
+                        goal_handle.publish_feedback(feedback_msg)
+
+                        if result:
+                            goal_handle.succeed()
+                            result = Navigation.Result()
+                            result.success = True
+                            return result
+
+                    except Exception as exc:  # pylint: disable=broad-except
+                        print(exc)
+                        print('Graph nav command line client threw an error.')
+                        result = Navigation.Result()
+                        result.success = False
+                        return result
+
+        except ResourceAlreadyClaimedError:
+            print('The robot\'s lease is currently in use. Check for a tablet connection or try again in a few seconds.')
+            result = Navigation.Result()
+            result.success = False
+            return result
+
+    def run(self):
+        try:
+            with LeaseKeepAlive(self.lease_client, must_acquire=True, return_at_exit=True):
                 # Upload Graph
                 try:
-                    cmd_func = graph_nav_command_line._command_dictionary['5']
+                    cmd_func = self.graph_nav_command_line._command_dictionary['5']
                     cmd_func()
                 except Exception as e:
                     print(e)
@@ -613,7 +699,7 @@ class NavROS2SDK(Node):
 
                 # List waypoints
                 try:
-                    cmd_func = graph_nav_command_line._command_dictionary['4']
+                    cmd_func = self.graph_nav_command_line._command_dictionary['4']
                     cmd_func()
                 except Exception as e:
                     print(e)
@@ -621,7 +707,52 @@ class NavROS2SDK(Node):
 
                 # Initialize localization to the nearest fiducial (must be in sight of a fiducial).
                 #try:
-                #    cmd_func = graph_nav_command_line._command_dictionary['2']
+                #    cmd_func = self.graph_nav_command_line._command_dictionary['2']
+                #    cmd_func()
+                #except Exception as e:
+                #    print(e)
+                #    result = navigation.Result()
+                #    result.success = False
+                #    return result
+
+                # Initialize localization to a specific waypoint (must be exactly at the waypoint).
+                try:
+                    cmd_func = self.graph_nav_command_line._command_dictionary['3']
+                    cmd_func(['rp'])
+                except Exception as e:
+                    print(e)
+                    return False
+        except ResourceAlreadyClaimedError:
+            print('The robot\'s lease is currently in use. Check for a tablet connection or try again in a few seconds.')
+            return False
+
+        print("Ready!")
+
+        while rclpy.ok():
+            rclpy.spin_once(self)
+
+    def run_temp(self):
+        try:
+            with LeaseKeepAlive(self.lease_client, must_acquire=True, return_at_exit=True):
+                # Upload Graph
+                try:
+                    cmd_func = self.graph_nav_command_line._command_dictionary['5']
+                    cmd_func()
+                except Exception as e:
+                    print(e)
+                    return False
+
+                # List waypoints
+                try:
+                    cmd_func = self.graph_nav_command_line._command_dictionary['4']
+                    cmd_func()
+                except Exception as e:
+                    print(e)
+                    return False
+
+                # Initialize localization to the nearest fiducial (must be in sight of a fiducial).
+                #try:
+                #    cmd_func = self.graph_nav_command_line._command_dictionary['2']
                 #    cmd_func()
                 #except Exception as e:
                 #    print(e)
@@ -629,7 +760,7 @@ class NavROS2SDK(Node):
 
                 # Initialize localization to a specific waypoint (must be exactly at the waypoint).
                 try:
-                    cmd_func = graph_nav_command_line._command_dictionary['3']
+                    cmd_func = self.graph_nav_command_line._command_dictionary['3']
                     cmd_func(['rp'])
                 except Exception as e:
                     print(e)
@@ -643,11 +774,11 @@ class NavROS2SDK(Node):
                     try:    
                         # Send command
                         #print(f"Send command: i: {i}")
-                        result = graph_nav_command_line.run_next_position_once(destinations[i][0],destinations[i][1],destinations[i][2])
+                        result = self.graph_nav_command_line.run_next_position_once(destinations[i][0],destinations[i][1],destinations[i][2])
                         print(f'Is it Completed: {result}')
 
                         # Get Robot position
-                        print(f'X: {graph_nav_command_line._robot_state_x}  Y: {graph_nav_command_line._robot_state_y}  YAW: {graph_nav_command_line._robot_state_yaw}')
+                        print(f'X: {self.graph_nav_command_line._robot_state_x}  Y: {self.graph_nav_command_line._robot_state_y}  YAW: {self.graph_nav_command_line._robot_state_yaw}')
 
                         if result:       
                             i = i + 1
@@ -663,17 +794,17 @@ class NavROS2SDK(Node):
             return False
 
 
-    def run_path(self, graph_nav_command_line, lease_client):
+    def run_path(self):
         try:
-            with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
+            with LeaseKeepAlive(self.lease_client, must_acquire=True, return_at_exit=True):
                 try:
                     # Send number of random waypoints
                     #graph_nav_command_line.run(3)
                    
                     # Send a sequence of positions
-                    graph_nav_command_line.run_next_position(1.67,0,3.1)
-                    graph_nav_command_line.run_next_position(2.0,-2.0,0)
-                    graph_nav_command_line.run_next_position(1.67,0,3.1)
+                    self.graph_nav_command_line.run_next_position(1.67,0,3.1)
+                    self.graph_nav_command_line.run_next_position(2.0,-2.0,0)
+                    self.graph_nav_command_line.run_next_position(1.67,0,3.1)
 
                     return True
                 except Exception as exc:  # pylint: disable=broad-except
@@ -706,14 +837,14 @@ def main(argv=None):
 
     # ROS2
     rclpy.init()
-    node = NavROS2SDK()
+    node = NavROS2SDK(graph_nav_command_line, lease_client)
     
     # ROS2 - Multithread
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     
     # Loop
-    node.run(graph_nav_command_line, lease_client)
+    node.run()
     
     # Kill and shutdown
     node.destroy_node()
